@@ -1,0 +1,172 @@
+name: vendoring CI (submodule)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      # submodules: true is exactly the flag whose absence breaks the release.
+      - name: Check out this repo WITH submodules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: submodule-consumer
+          submodules: true
+          persist-credentials: false
+
+      # zed-cli path-depends on ../zed-interfaces, so they must be siblings.
+      - name: Check out zed-cli
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: zed-pkg/zed-cli
+          path: zed-cli
+          persist-credentials: false
+      - name: Check out zed-interfaces
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: zed-pkg/zed-interfaces
+          path: zed-interfaces
+          persist-credentials: false
+
+      - name: Validate workflow
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+        with:
+          args: submodule-consumer/.github/workflows/ci.yml
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v6
+        with:
+          node-version: 22
+
+      - name: Build the zed CLI
+        run: |
+          set -euo pipefail
+          cargo build --release --bin zed --manifest-path zed-cli/Cargo.toml
+          echo "ZED=$GITHUB_WORKSPACE/zed-cli/target/release/zed" >> "$GITHUB_ENV"
+
+      - name: Publish gate - the vendored file must exist before packing
+        working-directory: submodule-consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The mitigation this fixture recommends: assert the submodule content
+          # is present rather than trusting the checkout to have fetched it.
+          test -f vendor/schema/schema.json \
+            || { echo "::error::submodule not initialized; run git submodule update --init" >&2; exit 1; }
+
+      - name: With the submodule present, the artifact is complete and runs
+        working-directory: submodule-consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ZED" pack
+          tar tzf .zed/pack/zedtest-submodule-consumer-0.1.0.tar.gz \
+            > "$RUNNER_TEMP/with-submodule.txt"
+          cat "$RUNNER_TEMP/with-submodule.txt"
+          grep -Fxq pkg/vendor/schema/schema.json "$RUNNER_TEMP/with-submodule.txt"
+
+          rm -rf "$RUNNER_TEMP/extract-ok"
+          mkdir -p "$RUNNER_TEMP/extract-ok"
+          tar xzf .zed/pack/zedtest-submodule-consumer-0.1.0.tar.gz \
+            -C "$RUNNER_TEMP/extract-ok"
+          cd "$RUNNER_TEMP/extract-ok/pkg"
+          test "$(node -e 'process.stdout.write(require("./src/index.js").TITLE)')" \
+             = "GreetingEvent"
+
+      - name: KNOWN GAP - packing without the submodule fails silently
+        working-directory: submodule-consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Characterization. `git clone` and actions/checkout both leave
+          # submodules empty by default, and zed reports success anyway -- the
+          # artifact is simply missing files.
+          #
+          # If zed learns to warn or fail here, THIS STEP SHOULD FAIL. Update the
+          # fixture then; do not delete the check.
+          scratch="$RUNNER_TEMP/no-submodule"
+          rm -rf "$scratch"
+          cp -a . "$scratch"
+          rm -rf "$scratch/.zed" "$scratch/vendor/schema"
+          mkdir -p "$scratch/vendor/schema"
+          cd "$scratch"
+
+          if ! "$ZED" pack > out.log 2>&1; then
+            echo "::error::zed now rejects an empty submodule dir -- gap fixed"
+            cat out.log
+            exit 1
+          fi
+          cat out.log
+          tar tzf .zed/pack/zedtest-submodule-consumer-0.1.0.tar.gz \
+            > "$RUNNER_TEMP/without-submodule.txt"
+          if grep -q 'vendor/schema/schema.json' "$RUNNER_TEMP/without-submodule.txt"; then
+            echo "::error::schema present without the submodule -- test is not exercising the case"
+            exit 1
+          fi
+
+          # The decisive part: the published artifact is broken at runtime.
+          rm -rf "$RUNNER_TEMP/extract-bad"
+          mkdir -p "$RUNNER_TEMP/extract-bad"
+          tar xzf .zed/pack/zedtest-submodule-consumer-0.1.0.tar.gz \
+            -C "$RUNNER_TEMP/extract-bad"
+          cd "$RUNNER_TEMP/extract-bad/pkg"
+          if node -e 'require("./src/index.js")' 2> err.log; then
+            echo "::error::the incomplete artifact somehow worked"
+            exit 1
+          fi
+          grep -q 'ENOENT' err.log
+
+      - name: KNOWN GAP - gitignored files are published anyway
+        working-directory: submodule-consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          # .gitignore is never consulted; only built-in globs, publish.exclude
+          # and .zedignore are. A gitignored secret is a publish candidate.
+          #
+          # If zed starts honouring .gitignore, THIS STEP SHOULD FAIL.
+          scratch="$RUNNER_TEMP/ignore-probe"
+          rm -rf "$scratch"
+          cp -a . "$scratch"
+          rm -rf "$scratch/.zed"
+          cd "$scratch"
+          printf 'NOT_A_REAL_SECRET=placeholder\n' > .env
+          printf '.env\n' >> .gitignore
+
+          "$ZED" pack > /dev/null 2>&1
+          tar tzf .zed/pack/zedtest-submodule-consumer-0.1.0.tar.gz > listing.txt
+          if ! grep -Fxq pkg/.env listing.txt; then
+            echo "::error::.gitignore is now honoured -- update this fixture"
+            exit 1
+          fi
+
+          # ...and .zedignore is the documented mitigation.
+          rm -rf .zed
+          printf '.env\n' > .zedignore
+          "$ZED" pack > /dev/null 2>&1
+          tar tzf .zed/pack/zedtest-submodule-consumer-0.1.0.tar.gz > listing2.txt
+          if grep -Fxq pkg/.env listing2.txt; then
+            echo "::error::.zedignore did not exclude the file"
+            exit 1
+          fi
+
+      - name: Upload artifact listings
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: submodule-artifact-listings
+          path: ${{ runner.temp }}/*.txt
+          if-no-files-found: warn
+          retention-days: 7
