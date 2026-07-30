@@ -1,0 +1,3 @@
+[submodule "vendor/schema"]
+	path = vendor/schema
+	url = https://github.com/zed-pkg-test/shared-schema.git
