@@ -1,2 +1,6 @@
 .zed/
 node_modules/
+tmp
+temp
+tmp/worktrees
+temp/worktrees
