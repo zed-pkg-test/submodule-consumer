@@ -8,3 +8,16 @@ license = "MIT"
 [package.repository]
 vcs = "git"
 url = "https://github.com/zed-pkg-test/submodule-consumer"
+
+
+[interop.source-composition]
+checkout_dir = ".zed/vcs"
+git_submodule_dir = "submodules"
+
+[interop.source-composition.sources.shared-schema]
+vcs = "git"
+url = "https://github.com/zed-pkg-test/shared-schema.git"
+role = "embedded-source"
+projection = "git-submodule"
+path = "vendor/schema"
+recursive = true
